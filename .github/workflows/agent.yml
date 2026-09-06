@@ -34,13 +34,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          node-version: '20'
+          go-version: '1.22'
 
-      - name: Install dependencies
-        run: cd agent && npm install
+      - name: Build agent
+        run: |
+          cd agent-go
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../agent-agent-linux-amd64 -ldflags="-s -w" .
 
       - name: Start Agent
         env:
@@ -49,4 +51,4 @@ jobs:
           USER_ID: ${{ github.event.inputs.user_id }}
           SESSION_ID: ${{ github.event.inputs.session_id }}
           DURATION_MINUTES: ${{ github.event.inputs.duration_minutes }}
-        run: cd agent && node index.js
+        run: ./agent-agent-linux-amd64
