@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -101,6 +101,7 @@ type Agent struct {
 	stdinWriters map[string]io.WriteCloser
 	vms          map[string]*vmShell
 	pending      map[string][]byte
+	artifactAcks sync.Map // buildId -> chan string (artifact_ack url)
 	mu           sync.Mutex
 }
 
@@ -230,6 +231,19 @@ func (a *Agent) readLoop() {
 		case "terminal_resize":
 			// No-op: pipe-backed docker exec shell has a fixed geometry.
 
+		case "artifact_ack":
+			var ack struct {
+				Type        string `json:"type"`
+				BuildID     string `json:"buildId"`
+				ArtifactURL string `json:"artifactUrl"`
+			}
+			if err := json.Unmarshal(raw, &ack); err != nil {
+				continue
+			}
+			if ch, ok := a.artifactAcks.LoadAndDelete(ack.BuildID); ok {
+				ch.(chan string) <- ack.ArtifactURL
+			}
+
 		case "shutdown":
 			log.Printf("[agent] Shutdown: %s", msg.Reason)
 			a.conn.Close()
@@ -299,8 +313,9 @@ func (a *Agent) handleBuild(req BuildRequest) {
 	if artifact != "" {
 		a.sendProgress(req.BuildID, fmt.Sprintf("Build succeeded: %s", artifact))
 
-		// Upload the artifact to the backend so the user can download it.
-		arrURL, err := a.uploadArtifact(req.BuildID, artifact)
+		// Upload the artifact to the backend over the existing WebSocket
+		// (the Cloudflare tunnel throttles large HTTP uploads).
+		arrURL, err := a.sendArtifactOverWS(req.BuildID, artifact)
 		if err != nil {
 			a.sendProgress(req.BuildID, fmt.Sprintf("Artifact upload failed: %v", err))
 		}
@@ -324,43 +339,68 @@ func (a *Agent) handleBuild(req BuildRequest) {
 	}
 }
 
-// uploadArtifact POSTs the built binary to the backend for storage + serving.
-// Returns the public download URL on success.
-func (a *Agent) uploadArtifact(buildID, path string) (string, error) {
+// sendArtifactOverWS streams a file to the backend in base64 chunks over the
+// agent's WebSocket connection and waits for the backend's artifact_ack.
+func (a *Agent) sendArtifactOverWS(buildID, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
-	uploadURL := strings.TrimSuffix(a.cfg.BackendURL, "/") + "/api/artifacts/" + buildID + "/" + filepath.Base(path)
-
-	req, err := http.NewRequest(http.MethodPost, uploadURL, f)
+	info, err := f.Stat()
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
 
-	client := &http.Client{Timeout: 300 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+	filename := filepath.Base(path)
+	if err := a.send(map[string]interface{}{
+		"type":     "artifact_start",
+		"buildId":  buildID,
+		"filename": filename,
+		"size":     info.Size(),
+	}); err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("backend returned %d: %s", resp.StatusCode, string(body)[:200])
+	const chunkSize = 256 * 1024
+	buf := make([]byte, chunkSize)
+	index := 0
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			if err := a.send(map[string]interface{}{
+				"type":    "artifact_chunk",
+				"buildId": buildID,
+				"index":   index,
+				"data":    base64.StdEncoding.EncodeToString(buf[:n]),
+			}); err != nil {
+				return "", err
+			}
+			index++
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
 	}
 
-	var out struct {
-		ArtifactURL string `json:"artifactUrl"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	respCh := make(chan string, 1)
+	a.artifactAcks.Store(buildID, respCh)
+	defer a.artifactAcks.Delete(buildID)
+
+	if err := a.send(map[string]interface{}{"type": "artifact_finish", "buildId": buildID}); err != nil {
 		return "", err
 	}
-	log.Printf("[agent] Artifact uploaded for %s -> %s", buildID, out.ArtifactURL)
-	return out.ArtifactURL, nil
+
+	select {
+	case url := <-respCh:
+		return url, nil
+	case <-time.After(60 * time.Second):
+		return "", fmt.Errorf("timed out waiting for artifact_ack")
+	}
 }
 
 func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
