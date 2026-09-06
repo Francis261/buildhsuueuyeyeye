@@ -364,9 +364,19 @@ func (a *Agent) uploadArtifact(buildID, path string) (string, error) {
 }
 
 func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
-	a.sendProgress(req.BuildID, "Running expo prebuild...")
-	if _, err := runCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install"); err != nil {
-		a.sendProgress(req.BuildID, "Prebuild warnings, continuing...")
+	gradlew := filepath.Join(projectDir, "android", "gradlew")
+
+	if _, err := os.Stat(gradlew); err != nil {
+		// The shipped android/ dir is authored source (no gradlew wrapper binary).
+		// Regenerate a runnable native project from app.json.
+		a.sendProgress(req.BuildID, "Running expo prebuild (clean)...")
+		if out, err := runCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install", "--clean"); err != nil {
+			a.sendProgress(req.BuildID, "Prebuild warnings, continuing...")
+			_ = out
+		}
+	} else {
+		a.sendProgress(req.BuildID, "Running expo prebuild...")
+		runCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install")
 	}
 
 	if req.Platform == "web" {
@@ -383,20 +393,16 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 		gradleTask = "bundleRelease"
 	}
 
-	gradlew := filepath.Join(projectDir, "android", "gradlew")
-	if _, err := os.Stat(gradlew); err == nil {
-		a.sendProgress(req.BuildID, fmt.Sprintf("Running gradle %s...", gradleTask))
-		runCmd(projectDir, "chmod", "+x", gradlew)
-		if out, err := runCmd(filepath.Join(projectDir, "android"), gradlew, gradleTask, "--no-daemon"); err != nil {
-			a.sendBuildFailed(req.BuildID, out)
-			return
-		}
-	} else {
-		a.sendProgress(req.BuildID, "No gradlew found, using expo run...")
-		if out, err := runCmd(projectDir, "npx", "expo", "run:android", "--variant", req.Variant); err != nil {
-			a.sendBuildFailed(req.BuildID, out)
-			return
-		}
+	if _, err := os.Stat(gradlew); err != nil {
+		a.sendBuildFailed(req.BuildID, "No gradlew found after prebuild; cannot run gradle build")
+		return
+	}
+
+	a.sendProgress(req.BuildID, fmt.Sprintf("Running gradle %s...", gradleTask))
+	runCmd(projectDir, "chmod", "+x", gradlew)
+	if out, err := runCmd(filepath.Join(projectDir, "android"), gradlew, gradleTask, "--no-daemon"); err != nil {
+		a.sendBuildFailed(req.BuildID, out)
+		return
 	}
 }
 
