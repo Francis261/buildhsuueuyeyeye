@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -91,18 +94,30 @@ type BuildMeta struct {
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
 type Agent struct {
-	cfg    Config
-	conn   *websocket.Conn
-	done   chan struct{}
- shells map[string]*exec.Cmd
+	cfg          Config
+	conn         *websocket.Conn
+	done         chan struct{}
+	shells       map[string]*exec.Cmd
+	stdinWriters map[string]io.WriteCloser
+	vms          map[string]*vmShell
+	mu           sync.Mutex
 }
 
 func NewAgent(cfg Config) *Agent {
 	return &Agent{
-		cfg:    cfg,
-		done:   make(chan struct{}),
-		shells: make(map[string]*exec.Cmd),
+		cfg:          cfg,
+		done:         make(chan struct{}),
+		shells:       make(map[string]*exec.Cmd),
+		stdinWriters: make(map[string]io.WriteCloser),
+		vms:          make(map[string]*vmShell),
 	}
+}
+
+// vmShell is a single docker-backed terminal session scoped to one user session.
+type vmShell struct {
+	container string
+	exec      *exec.Cmd
+	stdin     io.WriteCloser
 }
 
 func (a *Agent) Run() {
@@ -197,6 +212,20 @@ func (a *Agent) readLoop() {
 			}
 			a.handleTerminal(td.SessionID, td.Data)
 
+		case "terminal_start":
+			var ts struct {
+				Type       string `json:"type"`
+				SessionID  string `json:"sessionId"`
+				ProjectDir string `json:"projectDir"`
+			}
+			if err := json.Unmarshal(raw, &ts); err != nil {
+				continue
+			}
+			a.startTerminalVM(ts.SessionID, ts.ProjectDir)
+
+		case "terminal_resize":
+			// No-op: pipe-backed docker exec shell has a fixed geometry.
+
 		case "shutdown":
 			log.Printf("[agent] Shutdown: %s", msg.Reason)
 			a.conn.Close()
@@ -265,12 +294,22 @@ func (a *Agent) handleBuild(req BuildRequest) {
 	artifact := a.findArtifact(projectDir, req.Format)
 	if artifact != "" {
 		a.sendProgress(req.BuildID, fmt.Sprintf("Build succeeded: %s", artifact))
-		a.send(map[string]interface{}{
-			"type":       "build_complete",
-			"buildId":    req.BuildID,
-			"status":     "succeeded",
-			"artifactUrl": "local://" + artifact,
-		})
+
+		// Upload the artifact to the backend so the user can download it.
+		arrURL, err := a.uploadArtifact(req.BuildID, artifact)
+		if err != nil {
+			a.sendProgress(req.BuildID, fmt.Sprintf("Artifact upload failed: %v", err))
+		}
+
+		msg := map[string]interface{}{
+			"type":    "build_complete",
+			"buildId": req.BuildID,
+			"status":  "succeeded",
+		}
+		if arrURL != "" {
+			msg["artifactUrl"] = arrURL
+		}
+		a.send(msg)
 	} else {
 		a.sendProgress(req.BuildID, "Build completed but no artifact found")
 		a.send(map[string]interface{}{
@@ -279,6 +318,45 @@ func (a *Agent) handleBuild(req BuildRequest) {
 			"status":  "succeeded",
 		})
 	}
+}
+
+// uploadArtifact POSTs the built binary to the backend for storage + serving.
+// Returns the public download URL on success.
+func (a *Agent) uploadArtifact(buildID, path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	uploadURL := strings.TrimSuffix(a.cfg.BackendURL, "/") + "/api/artifacts/" + buildID + "/" + filepath.Base(path)
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, f)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("backend returned %d: %s", resp.StatusCode, string(body)[:200])
+	}
+
+	var out struct {
+		ArtifactURL string `json:"artifactUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	log.Printf("[agent] Artifact uploaded for %s -> %s", buildID, out.ArtifactURL)
+	return out.ArtifactURL, nil
 }
 
 func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
@@ -376,68 +454,149 @@ func (a *Agent) sendBuildFailed(buildID, errMsg string) {
 
 // ── Terminal Handler ──────────────────────────────────────────────────────────
 
-func (a *Agent) handleTerminal(sessionID, data string) {
-	if _, ok := a.shells[sessionID]; !ok {
-		cmd := exec.Command("/bin/bash")
-		cmd.Dir = "/tmp"
-		cmd.Env = append(os.Environ(),
-			"TERM=xterm-256color",
-			"HOME=/root",
-			"PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin",
-		)
+// startTerminalVM provisions (once) a docker-backed sandbox per session, copies
+// the project source into /workspace, and starts an interactive shell attached
+// to the session. Falls back to a host /bin/bash if docker is unavailable.
+func (a *Agent) startTerminalVM(sessionID, projectDir string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.vms[sessionID]; ok {
+		return
+	}
 
-		stdin, _ := cmd.StdinPipe()
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
+	container := "apkbuilder-" + strings.ReplaceAll(sessionID, "-", "")
+	if len(container) > 24 {
+		container = container[:24]
+	}
+	log.Printf("[terminal] Provisioning VM for session %s (docker=%s)", sessionID, container)
 
-		if err := cmd.Start(); err != nil {
-			log.Printf("[terminal] Failed to start shell: %v", err)
-			return
+	// Create the container (idempotent).
+	out, err := runCmd("", "docker", "run", "-d", "-it", "--name", container, "node:20-alpine", "sleep", "infinity")
+	if err != nil {
+		log.Printf("[terminal] docker run failed (%v): %s", err, out)
+		// Fallback: host bash shell
+		a.startHostShell(sessionID)
+		return
+	}
+
+	// Copy project source into the VM, if we have a project dir.
+	var projLines string
+	if projectDir != "" {
+		if _, err := os.Stat(projectDir); err == nil {
+			runCmd("", "docker", "cp", projectDir+"/.", container+":/workspace")
+			projLines = "\r\n\x1b[1;32mProject source copied to /workspace\x1b[0m\r\n"
 		}
+	}
+	runCmd("", "docker", "exec", container, "sh", "-c", "mkdir -p /workspace && cd /workspace && echo $(ls | wc -l) files")
 
-		a.shells[sessionID] = cmd
+	// Start a shell attached to the container (cwd = /workspace inside VM).
+	cmd := exec.Command("docker", "exec", "-i", "-w", "/workspace", container, "/bin/sh")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
-		// Read stdout
-		go func() {
-			buf := make([]byte, 4096)
-			for {
-				n, err := stdout.Read(buf)
-				if n > 0 {
-					a.sendTerminalOutput(sessionID, string(buf[:n]))
-				}
-				if err != nil {
-					break
-				}
-			}
-		}()
-
-		// Read stderr
-		go func() {
-			buf := make([]byte, 4096)
-			for {
-				n, err := stderr.Read(buf)
-				if n > 0 {
-					a.sendTerminalOutput(sessionID, string(buf[:n]))
-				}
-				if err != nil {
-					break
-				}
-			}
-		}()
-
-		// Wait for exit
-		go func() {
-			cmd.Wait()
-			a.sendTerminalOutput(sessionID, "\r\n[Shell exited]\r\n")
-			delete(a.shells, sessionID)
-		}()
-
-		_ = stdin
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Printf("[terminal] stdin pipe: %v", err)
+		return
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[terminal] stdout pipe: %v", err)
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Printf("[terminal] stderr pipe: %v", err)
+		return
 	}
 
-	if cmd, ok := a.shells[sessionID]; ok && cmd.Process != nil {
-		cmd.Stdin.(interface{ Write([]byte) (int, error) }).Write([]byte(data))
+	if err := cmd.Start(); err != nil {
+		log.Printf("[terminal] Failed to start container shell: %v", err)
+		return
 	}
+
+	vm := &vmShell{container: container, exec: cmd, stdin: stdin}
+	a.vms[sessionID] = vm
+
+	pipeOutput := func(r io.Reader) {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				a.sendTerminalOutput(sessionID, string(buf[:n]))
+			}
+			if err != nil {
+				break
+			}
+		}
+	}
+	go pipeOutput(stdout)
+	go pipeOutput(stderr)
+
+	go func() {
+		cmd.Wait()
+		a.sendTerminalOutput(sessionID, "\r\n\x1b[33m[Shell exited]\x1b[0m\r\n")
+		a.mu.Lock()
+		delete(a.vms, sessionID)
+		a.mu.Unlock()
+	}()
+
+	if projLines != "" {
+		a.sendTerminalOutput(sessionID, projLines)
+	}
+}
+
+// startHostShell is the non-docker fallback.
+func (a *Agent) startHostShell(sessionID string) {
+	cmd := exec.Command("/bin/bash")
+	cmd.Dir = "/tmp"
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "HOME=/root")
+
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[terminal] Failed to start shell: %v", err)
+		return
+	}
+	a.shells[sessionID] = cmd
+
+	stdoutReader := func(r io.Reader) {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				a.sendTerminalOutput(sessionID, string(buf[:n]))
+			}
+			if err != nil {
+				break
+			}
+		}
+	}
+	go stdoutReader(stdout)
+	go stdoutReader(stderr)
+
+	go func() {
+		cmd.Wait()
+		a.sendTerminalOutput(sessionID, "\r\n\x1b[33m[Shell exited]\x1b[0m\r\n")
+		delete(a.shells, sessionID)
+	}()
+	a.stdinWriters[sessionID] = stdin
+}
+
+func (a *Agent) handleTerminal(sessionID, data string) {
+	a.mu.Lock()
+	if vm, ok := a.vms[sessionID]; ok {
+		vm.stdin.Write([]byte(data))
+		a.mu.Unlock()
+		return
+	}
+	if w, ok := a.stdinWriters[sessionID]; ok {
+		w.Write([]byte(data))
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
 }
 
 func (a *Agent) sendTerminalOutput(sessionID, data string) {
