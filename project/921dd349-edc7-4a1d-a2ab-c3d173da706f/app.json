@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "HelloAPK",
+    "slug": "helloapk",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "description": "End-to-end cloud build test",
+    "android": {
+      "package": "com.hello.apk"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
