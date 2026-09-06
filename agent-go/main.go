@@ -102,6 +102,7 @@ type Agent struct {
 	vms          map[string]*vmShell
 	pending      map[string][]byte
 	artifactAcks sync.Map // buildId -> chan string (artifact_ack url)
+	writeMu      sync.Mutex
 	mu           sync.Mutex
 }
 
@@ -257,6 +258,10 @@ func (a *Agent) send(v interface{}) error {
 	if err != nil {
 		return err
 	}
+	// gorilla/websocket is not safe for concurrent writers: the artifact
+	// stream (build goroutine) and the ping/pong loop can both call send().
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
 	return a.conn.WriteMessage(websocket.TextMessage, data)
 }
 
@@ -398,7 +403,7 @@ func (a *Agent) sendArtifactOverWS(buildID, path string) (string, error) {
 	select {
 	case url := <-respCh:
 		return url, nil
-	case <-time.After(60 * time.Second):
+	case <-time.After(120 * time.Second):
 		return "", fmt.Errorf("timed out waiting for artifact_ack")
 	}
 }
