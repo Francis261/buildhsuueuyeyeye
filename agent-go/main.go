@@ -64,15 +64,15 @@ type Message struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"-"`
 	// Flat fields for convenience
-	Data     string `json:"data,omitempty"`
-	Line     string `json:"line,omitempty"`
-	BuildID  string `json:"buildId,omitempty"`
+	Data      string `json:"data,omitempty"`
+	Line      string `json:"line,omitempty"`
+	BuildID   string `json:"buildId,omitempty"`
 	SessionID string `json:"sessionId,omitempty"`
-	Code     int    `json:"code,omitempty"`
-	Error    string `json:"error,omitempty"`
-	Message  string `json:"message,omitempty"`
-	AgentID  string `json:"agentId,omitempty"`
-	Reason   string `json:"reason,omitempty"`
+	Code      int    `json:"code,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Message   string `json:"message,omitempty"`
+	AgentID   string `json:"agentId,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 type BuildRequest struct {
@@ -100,6 +100,7 @@ type Agent struct {
 	shells       map[string]*exec.Cmd
 	stdinWriters map[string]io.WriteCloser
 	vms          map[string]*vmShell
+	pending      map[string][]byte
 	mu           sync.Mutex
 }
 
@@ -110,6 +111,7 @@ func NewAgent(cfg Config) *Agent {
 		shells:       make(map[string]*exec.Cmd),
 		stdinWriters: make(map[string]io.WriteCloser),
 		vms:          make(map[string]*vmShell),
+		pending:      make(map[string][]byte),
 	}
 }
 
@@ -221,7 +223,9 @@ func (a *Agent) readLoop() {
 			if err := json.Unmarshal(raw, &ts); err != nil {
 				continue
 			}
-			a.startTerminalVM(ts.SessionID, ts.ProjectDir)
+			// Provision in the background: pulling the base image can take ~1min,
+			// which must not block the read loop (ping/pong) or the WS dies.
+			go a.startTerminalVM(ts.SessionID, ts.ProjectDir)
 
 		case "terminal_resize":
 			// No-op: pipe-backed docker exec shell has a fixed geometry.
@@ -517,6 +521,12 @@ func (a *Agent) startTerminalVM(sessionID, projectDir string) {
 	vm := &vmShell{container: container, exec: cmd, stdin: stdin}
 	a.vms[sessionID] = vm
 
+	// Flush any input that arrived while the VM was provisioning.
+	if buf, ok := a.pending[sessionID]; ok {
+		vm.stdin.Write(buf)
+		delete(a.pending, sessionID)
+	}
+
 	pipeOutput := func(r io.Reader) {
 		buf := make([]byte, 4096)
 		for {
@@ -596,6 +606,8 @@ func (a *Agent) handleTerminal(sessionID, data string) {
 		a.mu.Unlock()
 		return
 	}
+	// VM still provisioning — queue the keystrokes.
+	a.pending[sessionID] = append(a.pending[sessionID], []byte(data)...)
 	a.mu.Unlock()
 }
 
