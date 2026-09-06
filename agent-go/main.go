@@ -133,8 +133,11 @@ func (a *Agent) connect() error {
 		return err
 	}
 
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	c, resp, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("bad handshake (HTTP %d): %w", resp.StatusCode, err)
+		}
 		return err
 	}
 	a.conn = c
