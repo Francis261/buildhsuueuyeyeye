@@ -28,7 +28,7 @@ on:
 jobs:
   agent:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.inputs.duration_minutes }}
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
