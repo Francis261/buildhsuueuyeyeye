@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -108,6 +109,7 @@ type Agent struct {
 
 	buildPgids map[int]bool // process groups of running build commands
 	buildOpsMu sync.Mutex
+	cancelling int32 // atomic: 1 when a user-cancel is in progress (vs budget kill)
 }
 
 func NewAgent(cfg Config) *Agent {
@@ -220,6 +222,18 @@ func (a *Agent) readLoop() {
 			}
 			go a.handleBuild(req)
 
+		case "build_cancel":
+			var bc struct {
+				Type    string `json:"type"`
+				BuildID string `json:"buildId"`
+			}
+			if err := json.Unmarshal(raw, &bc); err != nil {
+				continue
+			}
+			log.Printf("[agent] Cancel requested for build %s (agent keeps running)", bc.BuildID)
+			atomic.StoreInt32(&a.cancelling, 1)
+			a.killBuild()
+
 		case "terminal_data":
 			var td struct {
 				Type      string `json:"type"`
@@ -311,9 +325,22 @@ func (a *Agent) handleBuild(req BuildRequest) {
 
 	// Install dependencies
 	a.sendProgress(req.BuildID, "Installing dependencies...")
+	atomic.StoreInt32(&a.cancelling, 0)
+	if a.cancelled() {
+		a.sendBuildCancelled(req.BuildID)
+		return
+	}
 	if out, err := a.runBuildCmd(projectDir, "npm", "install"); err != nil {
+		if a.cancelled() {
+			a.sendBuildCancelled(req.BuildID)
+			return
+		}
 		a.sendProgress(req.BuildID, fmt.Sprintf("npm install failed: %s", out))
 		a.sendBuildFailed(req.BuildID, err.Error())
+		return
+	}
+	if a.cancelled() {
+		a.sendBuildCancelled(req.BuildID)
 		return
 	}
 	a.sendProgress(req.BuildID, "Dependencies installed")
@@ -326,6 +353,11 @@ func (a *Agent) handleBuild(req BuildRequest) {
 		a.buildHybrid(projectDir, req)
 	default:
 		a.sendBuildFailed(req.BuildID, fmt.Sprintf("Unknown framework: %s", req.Meta.Framework))
+		return
+	}
+
+	if a.cancelled() {
+		a.sendBuildCancelled(req.BuildID)
 		return
 	}
 
@@ -432,6 +464,10 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 		// Regenerate a runnable native project from app.json.
 		a.sendProgress(req.BuildID, "Running expo prebuild (clean)...")
 		if out, err := a.runBuildCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install", "--clean"); err != nil {
+			if a.cancelled() {
+				a.sendBuildCancelled(req.BuildID)
+				return
+			}
 			a.sendProgress(req.BuildID, "Prebuild warnings, continuing...")
 			_ = out
 		}
@@ -440,9 +476,18 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 		a.runBuildCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install")
 	}
 
+	if a.cancelled() {
+		a.sendBuildCancelled(req.BuildID)
+		return
+	}
+
 	if req.Platform == "web" {
 		a.sendProgress(req.BuildID, "Building web bundle...")
 		if out, err := a.runBuildCmd(projectDir, "npx", "expo", "export", "--platform", "web"); err != nil {
+			if a.cancelled() {
+				a.sendBuildCancelled(req.BuildID)
+				return
+			}
 			a.sendBuildFailed(req.BuildID, out)
 			return
 		}
@@ -462,6 +507,10 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 	a.sendProgress(req.BuildID, fmt.Sprintf("Running gradle %s...", gradleTask))
 	a.runBuildCmd(projectDir, "chmod", "+x", gradlew)
 	if out, err := a.runBuildCmd(filepath.Join(projectDir, "android"), gradlew, gradleTask, "--no-daemon"); err != nil {
+		if a.cancelled() {
+			a.sendBuildCancelled(req.BuildID)
+			return
+		}
 		a.sendBuildFailed(req.BuildID, out)
 		return
 	}
@@ -470,6 +519,10 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 func (a *Agent) buildHybrid(projectDir string, req BuildRequest) {
 	a.sendProgress(req.BuildID, "Building Vite bundle...")
 	if out, err := a.runBuildCmd(projectDir, "npx", "vite", "build"); err != nil {
+		if a.cancelled() {
+			a.sendBuildCancelled(req.BuildID)
+			return
+		}
 		a.sendBuildFailed(req.BuildID, out)
 		return
 	}
@@ -520,6 +573,20 @@ func (a *Agent) sendBuildFailed(buildID, errMsg string) {
 		"buildId": buildID,
 		"status":  "failed",
 		"error":   errMsg,
+	})
+}
+
+// cancelled reports whether a user requested cancellation of the current build.
+func (a *Agent) cancelled() bool {
+	return atomic.LoadInt32(&a.cancelling) == 1
+}
+
+func (a *Agent) sendBuildCancelled(buildID string) {
+	log.Printf("[build:%s] CANCELLED", buildID)
+	a.send(map[string]interface{}{
+		"type":    "build_complete",
+		"buildId": buildID,
+		"status":  "cancelled",
 	})
 }
 
