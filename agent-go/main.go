@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -104,6 +105,9 @@ type Agent struct {
 	artifactAcks sync.Map // buildId -> chan string (artifact_ack url)
 	writeMu      sync.Mutex
 	mu           sync.Mutex
+
+	buildPgids map[int]bool // process groups of running build commands
+	buildOpsMu sync.Mutex
 }
 
 func NewAgent(cfg Config) *Agent {
@@ -114,6 +118,7 @@ func NewAgent(cfg Config) *Agent {
 		stdinWriters: make(map[string]io.WriteCloser),
 		vms:          make(map[string]*vmShell),
 		pending:      make(map[string][]byte),
+		buildPgids:   make(map[int]bool),
 	}
 }
 
@@ -127,6 +132,16 @@ type vmShell struct {
 func (a *Agent) Run() {
 	log.Printf("[agent] Starting... Backend=%s Account=%s User=%s Session=%s Duration=%dm",
 		a.cfg.BackendURL, a.cfg.AccountID, a.cfg.UserID, a.cfg.SessionID, a.cfg.DurationMinutes)
+
+	// Enforce the paid time budget locally: when it elapses, kill any running
+	// build/terminal and exit. This guarantees we never build past what the
+	// user paid for, even if the backend dies before sending shutdown.
+	go func() {
+		time.Sleep(time.Duration(a.cfg.DurationMinutes) * time.Minute)
+		log.Printf("[agent] Duration budget (%dm) elapsed — terminating", a.cfg.DurationMinutes)
+		a.killBuild()
+		os.Exit(0)
+	}()
 
 	for {
 		if err := a.connect(); err != nil {
@@ -247,6 +262,7 @@ func (a *Agent) readLoop() {
 
 		case "shutdown":
 			log.Printf("[agent] Shutdown: %s", msg.Reason)
+			a.killBuild()
 			a.conn.Close()
 			os.Exit(0)
 		}
@@ -295,7 +311,7 @@ func (a *Agent) handleBuild(req BuildRequest) {
 
 	// Install dependencies
 	a.sendProgress(req.BuildID, "Installing dependencies...")
-	if out, err := runCmd(projectDir, "npm", "install"); err != nil {
+	if out, err := a.runBuildCmd(projectDir, "npm", "install"); err != nil {
 		a.sendProgress(req.BuildID, fmt.Sprintf("npm install failed: %s", out))
 		a.sendBuildFailed(req.BuildID, err.Error())
 		return
@@ -415,18 +431,18 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 		// The shipped android/ dir is authored source (no gradlew wrapper binary).
 		// Regenerate a runnable native project from app.json.
 		a.sendProgress(req.BuildID, "Running expo prebuild (clean)...")
-		if out, err := runCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install", "--clean"); err != nil {
+		if out, err := a.runBuildCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install", "--clean"); err != nil {
 			a.sendProgress(req.BuildID, "Prebuild warnings, continuing...")
 			_ = out
 		}
 	} else {
 		a.sendProgress(req.BuildID, "Running expo prebuild...")
-		runCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install")
+		a.runBuildCmd(projectDir, "npx", "expo", "prebuild", "--platform", "android", "--no-install")
 	}
 
 	if req.Platform == "web" {
 		a.sendProgress(req.BuildID, "Building web bundle...")
-		if out, err := runCmd(projectDir, "npx", "expo", "export", "--platform", "web"); err != nil {
+		if out, err := a.runBuildCmd(projectDir, "npx", "expo", "export", "--platform", "web"); err != nil {
 			a.sendBuildFailed(req.BuildID, out)
 			return
 		}
@@ -444,8 +460,8 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 	}
 
 	a.sendProgress(req.BuildID, fmt.Sprintf("Running gradle %s...", gradleTask))
-	runCmd(projectDir, "chmod", "+x", gradlew)
-	if out, err := runCmd(filepath.Join(projectDir, "android"), gradlew, gradleTask, "--no-daemon"); err != nil {
+	a.runBuildCmd(projectDir, "chmod", "+x", gradlew)
+	if out, err := a.runBuildCmd(filepath.Join(projectDir, "android"), gradlew, gradleTask, "--no-daemon"); err != nil {
 		a.sendBuildFailed(req.BuildID, out)
 		return
 	}
@@ -453,16 +469,16 @@ func (a *Agent) buildReactNative(projectDir string, req BuildRequest) {
 
 func (a *Agent) buildHybrid(projectDir string, req BuildRequest) {
 	a.sendProgress(req.BuildID, "Building Vite bundle...")
-	if out, err := runCmd(projectDir, "npx", "vite", "build"); err != nil {
+	if out, err := a.runBuildCmd(projectDir, "npx", "vite", "build"); err != nil {
 		a.sendBuildFailed(req.BuildID, out)
 		return
 	}
 
 	if req.Platform == "android" || req.Platform == "ios" {
 		a.sendProgress(req.BuildID, fmt.Sprintf("Adding %s platform...", req.Platform))
-		runCmd(projectDir, "npx", "cap", "add", req.Platform)
+		a.runBuildCmd(projectDir, "npx", "cap", "add", req.Platform)
 		a.sendProgress(req.BuildID, "Syncing platform...")
-		runCmd(projectDir, "npx", "cap", "sync", req.Platform)
+		a.runBuildCmd(projectDir, "npx", "cap", "sync", req.Platform)
 	}
 }
 
@@ -525,10 +541,11 @@ func (a *Agent) startTerminalVM(sessionID, projectDir string) {
 	}
 	log.Printf("[terminal] Provisioning VM for session %s (docker=%s)", sessionID, container)
 
-	// Create the container (idempotent).
-	out, err := runCmd("", "docker", "run", "-d", "-it", "--name", container, "node:20-alpine", "sleep", "infinity")
-	if err != nil {
-		log.Printf("[terminal] docker run failed (%v): %s", err, out)
+	// Create (or reuse) the container idempotently: a previous shell may have
+	// exited and left the container running, and a later `docker run` with the
+	// same --name would otherwise fail with a name-conflict (exit 125).
+	if _, err := ensureContainer(container, "node:20-alpine"); err != nil {
+		log.Printf("[terminal] VM provision failed (%v): %v", container, err)
 		// Fallback: host bash shell
 		a.startHostShell(sessionID)
 		return
@@ -599,6 +616,8 @@ func (a *Agent) startTerminalVM(sessionID, projectDir string) {
 		a.mu.Lock()
 		delete(a.vms, sessionID)
 		a.mu.Unlock()
+		// Best-effort: free the container so a future provision can recreate it.
+		runCmd("", "docker", "rm", "-f", container)
 	}()
 
 	if projLines != "" {
@@ -677,6 +696,95 @@ func runCmd(dir string, name string, args ...string) (string, error) {
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// runBuildCmd runs a build step in its own process group and records the group
+// so killBuild can terminate it when the paid agent budget elapses.
+func (a *Agent) runBuildCmd(dir string, name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var out, errb bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+
+	a.buildOpsMu.Lock()
+	if err := cmd.Start(); err != nil {
+		a.buildOpsMu.Unlock()
+		return "", err
+	}
+	a.buildPgids[cmd.Process.Pid] = true
+	a.buildOpsMu.Unlock()
+
+	err := cmd.Wait()
+
+	a.buildOpsMu.Lock()
+	delete(a.buildPgids, cmd.Process.Pid)
+	a.buildOpsMu.Unlock()
+
+	if errb.Len() > 0 {
+		out.Write(errb.Bytes())
+	}
+	return out.String(), err
+}
+
+// killBuild hard-stops any in-flight build command (and terminal VMs) — used
+// when the time budget elapses or the backend orders a shutdown.
+func (a *Agent) killBuild() {
+	a.buildOpsMu.Lock()
+	pgids := make([]int, 0, len(a.buildPgids))
+	for pgid := range a.buildPgids {
+		pgids = append(pgids, pgid)
+	}
+	a.buildOpsMu.Unlock()
+
+	for _, pgid := range pgids {
+		// Negative pid targets the whole process group (Setpgid above).
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	}
+
+	a.mu.Lock()
+	containers := make([]string, 0, len(a.vms))
+	for _, vm := range a.vms {
+		containers = append(containers, vm.container)
+	}
+	a.mu.Unlock()
+	for _, c := range containers {
+		if _, err := runCmd("", "docker", "rm", "-f", c); err != nil {
+			log.Printf("[agent] cleanup container %s: %v", c, err)
+		}
+	}
+}
+
+// ensureContainer makes sure a docker container with the given name exists and
+// is running, creating it when absent or reusing/restarting it otherwise. This
+// keeps repeated terminal sessions idempotent (consistently shared agents reconnect
+// to the same VM instead of tripping over the container-name conflict).
+func ensureContainer(name, image string) (string, error) {
+	// Already running?
+	out, err := runCmd("", "docker", "inspect", "-f", "{{.State.Running}}", name)
+	if err == nil && strings.TrimSpace(out) == "true" {
+		return "reused-running", nil
+	}
+	if err == nil && strings.TrimSpace(out) == "false" {
+		if o, e := runCmd("", "docker", "start", name); e != nil {
+			return o, e
+		}
+		return "reused-stopped", nil
+	}
+	// Not present (or a generic error) -> recreate it.
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "no such") {
+		runCmd("", "docker", "rm", "-f", name) // best-effort cleanup of a broken state
+	}
+	out, err = runCmd("", "docker", "run", "-d", "-it", "--name", name, image, "sleep", "infinity")
+	if err != nil {
+		// Race with another provisioner: if it just appeared, start it.
+		if _, e := runCmd("", "docker", "start", name); e == nil {
+			return "reused-race", nil
+		}
+		return out, err
+	}
+	return "created", nil
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
