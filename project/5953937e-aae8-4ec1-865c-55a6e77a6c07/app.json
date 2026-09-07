@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "HelloAPK",
+    "slug": "helloapk",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "android": {
+      "package": "com.hello.apk"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
