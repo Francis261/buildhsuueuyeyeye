@@ -598,7 +598,21 @@ func (a *Agent) sendBuildCancelled(buildID string) {
 func (a *Agent) startTerminalVM(sessionID, projectDir string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if _, ok := a.vms[sessionID]; ok {
+	// Reattach: the shell from a previous connection is still running for this
+	// session. Emit a short banner and tap Enter so the shell redraws its
+	// prompt on the fresh client buffer.
+	if vm, ok := a.vms[sessionID]; ok {
+		log.Printf("[terminal] Reattaching existing shell for session %s", sessionID)
+		a.sendTerminalOutput(sessionID, "\r\n\x1b[1;36m[Reconnected]\x1b[0m\r\n")
+		vm.stdin.Write([]byte("\r"))
+		return
+	}
+	if _, ok := a.shells[sessionID]; ok {
+		log.Printf("[terminal] Reattaching existing host shell for session %s", sessionID)
+		a.sendTerminalOutput(sessionID, "\r\n\x1b[1;36m[Reconnected]\x1b[0m\r\n")
+		if w, ok := a.stdinWriters[sessionID]; ok {
+			w.Write([]byte("\r"))
+		}
 		return
 	}
 
