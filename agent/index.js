@@ -90,6 +90,20 @@ async function handleMessage(msg) {
       // Terminal resize handled per-session
       break;
 
+    case 'terminal_stop': {
+      // The user closed this terminal session tab. Kill its shell only.
+      const stopSid = msg.sessionId;
+      const shell = terminalSessions.get(stopSid);
+      if (shell && !shell.killed) {
+        console.log(`[terminal] Stopping session ${stopSid}`);
+        shell.kill('SIGKILL');
+      } else {
+        console.log(`[terminal] Stop ignored: unknown session ${stopSid}`);
+      }
+      terminalSessions.delete(stopSid);
+      break;
+    }
+
     case 'shutdown':
       console.log(`[agent] Shutdown requested: ${msg.reason}`);
       process.exit(0);
