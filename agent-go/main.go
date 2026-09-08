@@ -258,6 +258,20 @@ func (a *Agent) readLoop() {
 			// which must not block the read loop (ping/pong) or the WS dies.
 			go a.startTerminalVM(ts.SessionID, ts.ProjectDir)
 
+		case "terminal_stop":
+			var stop struct {
+				Type      string `json:"type"`
+				SessionID string `json:"sessionId"`
+			}
+			if err := json.Unmarshal(raw, &stop); err != nil {
+				continue
+			}
+			// The user closed this terminal session tab. Tear down its shell/VM
+			// so the container + PTY are freed immediately instead of lingering
+			// until the agent exits. Other sessions are untouched.
+			log.Printf("[terminal] Stopping session %s", stop.SessionID)
+			a.stopTerminalVM(stop.SessionID)
+
 		case "terminal_resize":
 			// No-op: pipe-backed docker exec shell has a fixed geometry.
 
@@ -774,6 +788,41 @@ func (a *Agent) sendTerminalOutput(sessionID, data string) {
 		"sessionId": sessionID,
 		"data":      data,
 	})
+}
+
+// stopTerminalVM tears down exactly one terminal session (the shell/PTY plus
+// its docker container / host bash). Other sessions on this agent are left
+// running. Safe to call for an unknown session id (no-op).
+func (a *Agent) stopTerminalVM(sessionID string) {
+	a.mu.Lock()
+	vm, hasVM := a.vms[sessionID]
+	shell, hasShell := a.shells[sessionID]
+	delete(a.vms, sessionID)
+	delete(a.shells, sessionID)
+	delete(a.stdinWriters, sessionID)
+	delete(a.pending, sessionID)
+	a.mu.Unlock()
+
+	if vm != nil && vm.exec != nil && vm.exec.Process != nil {
+		_ = vm.exec.Process.Kill()
+		_ = vm.exec.Wait()
+		if vm.container != "" {
+			go runCmd("", "docker", "rm", "-f", vm.container)
+		}
+		if hasVM {
+			log.Printf("[terminal] Stopped VM session %s (container %s)", sessionID, vm.container)
+		}
+	}
+	if shell != nil && shell.Process != nil {
+		_ = shell.Process.Kill()
+		_ = shell.Wait()
+		if hasShell {
+			log.Printf("[terminal] Stopped host shell session %s", sessionID)
+		}
+	}
+	if vm == nil && shell == nil {
+		log.Printf("[terminal] Stop ignored: unknown session %s", sessionID)
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
