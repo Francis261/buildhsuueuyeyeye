@@ -628,8 +628,12 @@ func (a *Agent) startTerminalVM(sessionID, projectDir string) {
 	}
 	runCmd("", "docker", "exec", container, "sh", "-c", "mkdir -p /workspace && cd /workspace && echo $(ls | wc -l) files")
 
-	// Start a shell attached to the container (cwd = /workspace inside VM).
-	cmd := exec.Command("docker", "exec", "-i", "-w", "/workspace", container, "/bin/sh")
+	// Start an interactive shell attached to the container (cwd = /workspace
+	// inside the VM). docker exec -it requires a client-side TTY or the shell
+	// runs non-interactively (no prompt, no input echo); `script` allocates
+	// that PTY and forwards stdin/stdout across the pipe.
+	cmd := exec.Command("script", "-qefc",
+		fmt.Sprintf("docker exec -it -w /workspace %s /bin/sh", container), "/dev/null")
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	stdin, err := cmd.StdinPipe()
@@ -694,7 +698,9 @@ func (a *Agent) startTerminalVM(sessionID, projectDir string) {
 
 // startHostShell is the non-docker fallback.
 func (a *Agent) startHostShell(sessionID string) {
-	cmd := exec.Command("/bin/bash")
+	// `script` allocates a PTY so the shell is interactive (prompt + echo),
+	// otherwise a pipe-backed bash runs non-interactively.
+	cmd := exec.Command("script", "-qefc", "/bin/bash", "/dev/null")
 	cmd.Dir = "/tmp"
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "HOME=/root")
 
