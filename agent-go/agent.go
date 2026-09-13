@@ -178,6 +178,14 @@ func (a *Agent) readLoop() {
 		case "terminal_resize":
 			// No-op
 
+		case "ai_request":
+			var req core.AIRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				log.Printf("[agent] Bad ai_request: %v", err)
+				continue
+			}
+			go a.ai.HandleAIRequest(req)
+
 		case "artifact_ack":
 			var ack struct {
 				Type        string `json:"type"`

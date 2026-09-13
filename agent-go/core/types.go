@@ -50,8 +50,32 @@ type BuildMeta struct {
 }
 
 type AIRequest struct {
-	Type      string `json:"type"`
-	RequestID string `json:"requestId"`
-	Model     string `json:"model"`
-	Prompt    string `json:"prompt"`
+	Type        string            `json:"type"`
+	RequestID   string            `json:"requestId"`
+	Model       string            `json:"model"`
+	Messages    []AIMessage       `json:"messages"`
+	File        *AIFileContext     `json:"file,omitempty"`
+	AgentConfig *AIAgentConfig    `json:"agentConfig,omitempty"`
+}
+
+type AIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type AIFileContext struct {
+	Path     string `json:"path"`
+	Content  string `json:"content"`
+	Language string `json:"language"`
+}
+
+type AIAgentConfig struct {
+	Provider    string   `json:"provider"`
+	APIKey      string   `json:"apiKey"`
+	BaseURL     string   `json:"baseUrl,omitempty"`
+	Models      []string `json:"models,omitempty"`
+	CustomModel string   `json:"customModel,omitempty"`
+	Temperature float64  `json:"temperature,omitempty"`
+	MaxTokens   int      `json:"maxTokens,omitempty"`
+	SystemPrompt string `json:"systemPrompt,omitempty"`
 }
