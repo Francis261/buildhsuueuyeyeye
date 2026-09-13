@@ -365,7 +365,7 @@ func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 45 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
