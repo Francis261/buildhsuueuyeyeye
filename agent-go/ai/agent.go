@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,11 +27,43 @@ func NewHandler(a core.AgentInterface) *Handler {
 }
 
 func (h *Handler) HandleAIRequest(req core.AIRequest) {
-	log.Printf("[ai] Request: requestId=%s model=%s provider=%s", req.RequestID, req.Model, req.AgentConfig.Provider)
+	log.Printf("[ai] Request: requestId=%s model=%s provider=%s fileCount=%d", req.RequestID, req.Model, req.AgentConfig.Provider, len(req.Files))
 
 	if req.AgentConfig == nil || req.AgentConfig.APIKey == "" {
 		h.sendError(req.RequestID, "AI is not configured. No API key provided.")
 		return
+	}
+
+	// Extract project files to a temp directory if provided.
+	var workDir string
+	var originalFiles map[string]string
+	if len(req.Files) > 0 {
+		tmpDir, err := os.MkdirTemp("", "ai-project-*")
+		if err != nil {
+			h.sendError(req.RequestID, fmt.Sprintf("Failed to create temp directory: %v", err))
+			return
+		}
+		defer os.RemoveAll(tmpDir)
+		workDir = tmpDir
+
+		// Extract files
+		originalFiles = make(map[string]string)
+		for relPath, content := range req.Files {
+			originalFiles[relPath] = content
+			fullPath := filepath.Join(tmpDir, relPath)
+			dir := filepath.Dir(fullPath)
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				log.Printf("[ai] Failed to create directory %s: %v", dir, err)
+				continue
+			}
+			if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+				log.Printf("[ai] Failed to write file %s: %v", relPath, err)
+				continue
+			}
+		}
+		log.Printf("[ai] Extracted %d files to %s", len(req.Files), tmpDir)
+	} else {
+		workDir = "."
 	}
 
 	// Resolve base URL.
@@ -84,7 +118,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 	}
 
 	// Create tool executor.
-	executor := tools.NewExecutor(".")
+	executor := tools.NewExecutor(workDir)
 
 	// Try models in order.
 	modelsToTry := dedupModels(append([]string{model}, req.AgentConfig.Models...))
@@ -100,7 +134,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 
 	var lastError string
 	for _, tryModel := range modelsToTry {
-		err := h.runWithTools(req.RequestID, baseURL, req.AgentConfig.APIKey, tryModel, messages, temperature, maxTokens, executor)
+		err := h.runWithTools(req.RequestID, baseURL, req.AgentConfig.APIKey, tryModel, messages, temperature, maxTokens, executor, workDir, originalFiles)
 		if err != nil {
 			lastError = fmt.Sprintf("Model %s error: %v", tryModel, err)
 			log.Printf("[ai] %s", lastError)
@@ -113,7 +147,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 }
 
 // runWithTools executes the AI loop with tool support.
-func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, executor *tools.Executor) error {
+func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, executor *tools.Executor, workDir string, originalFiles map[string]string) error {
 	toolDefs := tools.GetToolDefinitions()
 
 	for round := 0; round < maxToolRounds; round++ {
@@ -187,6 +221,11 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 		}
 
 		// No tool calls — this is the final text response.
+		// Before sending the response, sync any changed files back to the server.
+		if len(originalFiles) > 0 && workDir != "." {
+			h.syncChangedFiles(requestID, workDir, originalFiles)
+		}
+
 		if msg.Content != "" {
 			h.a.Send(map[string]interface{}{
 				"type":      "ai_response",
@@ -206,6 +245,68 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 	}
 
 	return fmt.Errorf("exceeded maximum tool rounds (%d)", maxToolRounds)
+}
+
+// syncChangedFiles compares the current files with the original and sends changes back to the server.
+func (h *Handler) syncChangedFiles(requestID, workDir string, originalFiles map[string]string) {
+	changedFiles := make(map[string]string)
+
+	// Walk the work directory and compare with original files
+	err := filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		// Get relative path from workDir
+		relPath, err := filepath.Rel(workDir, path)
+		if err != nil {
+			return nil
+		}
+		// Normalize path separators
+		relPath = filepath.ToSlash(relPath)
+
+		// Read current content
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		currentContent := string(content)
+		originalContent, existed := originalFiles[relPath]
+
+		// File is new or changed
+		if !existed || currentContent != originalContent {
+			changedFiles[relPath] = currentContent
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("[ai] Error walking work directory: %v", err)
+		return
+	}
+
+	// Check for deleted files
+	for relPath := range originalFiles {
+		fullPath := filepath.Join(workDir, relPath)
+		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+			// File was deleted - send empty content to signal deletion
+			changedFiles[relPath] = ""
+		}
+	}
+
+	if len(changedFiles) > 0 {
+		log.Printf("[ai] Syncing %d changed files back to server", len(changedFiles))
+		h.a.Send(map[string]interface{}{
+			"type":      "source_sync",
+			"requestId": requestID,
+			"files":     changedFiles,
+		})
+	}
 }
 
 // API response types.

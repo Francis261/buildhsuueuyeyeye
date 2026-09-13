@@ -55,6 +55,7 @@ type AIRequest struct {
 	Model       string            `json:"model"`
 	Messages    []AIMessage       `json:"messages"`
 	File        *AIFileContext     `json:"file,omitempty"`
+	Files       map[string]string `json:"files,omitempty"`
 	AgentConfig *AIAgentConfig    `json:"agentConfig,omitempty"`
 }
 
