@@ -251,6 +251,13 @@ func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, 
 
 		msg := choice[0].Message
 
+		log.Printf("[ai] Round %d: model=%s tool_calls=%d content_len=%d", round, model, len(msg.ToolCalls), len(msg.Content))
+		if len(msg.ToolCalls) > 0 {
+			for _, tc := range msg.ToolCalls {
+				log.Printf("[ai]   tool_call: %s args=%s", tc.Function.Name, truncate(string(tc.Function.Arguments), 200))
+			}
+		}
+
 		// Check for tool calls.
 		if len(msg.ToolCalls) > 0 {
 			// Detect loops: check if the same tool+args was called recently.
