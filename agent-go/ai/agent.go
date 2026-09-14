@@ -308,28 +308,82 @@ func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, 
 			// Convert API tool calls to our ToolCall type and build history-compatible tool_calls.
 			var toolCallsForHistory []map[string]interface{}
 			var toolCalls []tools.ToolCall
+
+			isGemini := strings.Contains(baseURL, "generativelanguage.googleapis.com") || strings.HasPrefix(model, "gemini")
+			isAnthropic := strings.Contains(baseURL, "anthropic.com") || strings.Contains(baseURL, "api.anthropic")
+
 			for _, tc := range msg.ToolCalls {
 				toolCalls = append(toolCalls, tools.ToolCall{
 					ID:   tc.ID,
 					Name: tc.Function.Name,
 					Args: tc.Function.Arguments,
 				})
-				toolCallsForHistory = append(toolCallsForHistory, map[string]interface{}{
-					"id":   tc.ID,
-					"type": "function",
-					"function": map[string]interface{}{
+
+				if isGemini {
+					// Gemini: functionCall inside parts.
+					var argsMap map[string]interface{}
+					json.Unmarshal(tc.Function.Arguments, &argsMap)
+					toolCallsForHistory = append(toolCallsForHistory, map[string]interface{}{
+						"functionCall": map[string]interface{}{
+							"name": tc.Function.Name,
+							"args": argsMap,
+						},
+					})
+				} else if isAnthropic {
+					// Anthropic: tool_use content block.
+					toolCallsForHistory = append(toolCallsForHistory, map[string]interface{}{
+						"type":      "tool_use",
+						"id":        tc.ID,
 						"name":      tc.Function.Name,
-						"arguments": json.RawMessage(tc.Function.Arguments),
-					},
-				})
+						"input":     json.RawMessage(tc.Function.Arguments),
+					})
+				} else {
+					// OpenAI-compatible.
+					toolCallsForHistory = append(toolCallsForHistory, map[string]interface{}{
+						"id":   tc.ID,
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      tc.Function.Name,
+							"arguments": json.RawMessage(tc.Function.Arguments),
+						},
+					})
+				}
 			}
 
 			// Add the assistant message with tool calls to history.
-			messages = append(messages, map[string]interface{}{
-				"role":       "assistant",
-				"content":    msg.Content,
-				"tool_calls": toolCallsForHistory,
-			})
+			if isGemini {
+				// Gemini: functionCall goes in parts alongside any text.
+				var parts []map[string]interface{}
+				if msg.Content != "" {
+					parts = append(parts, map[string]interface{}{"text": msg.Content})
+				}
+				parts = append(parts, toolCallsForHistory...)
+				messages = append(messages, map[string]interface{}{
+					"role":  "model",
+					"parts": parts,
+				})
+			} else if isAnthropic {
+				// Anthropic: content blocks with tool_use.
+				var contentBlocks []map[string]interface{}
+				if msg.Content != "" {
+					contentBlocks = append(contentBlocks, map[string]interface{}{
+						"type": "text",
+						"text": msg.Content,
+					})
+				}
+				contentBlocks = append(contentBlocks, toolCallsForHistory...)
+				messages = append(messages, map[string]interface{}{
+					"role":    "assistant",
+					"content": contentBlocks,
+				})
+			} else {
+				// OpenAI-compatible.
+				messages = append(messages, map[string]interface{}{
+					"role":       "assistant",
+					"content":    msg.Content,
+					"tool_calls": toolCallsForHistory,
+				})
+			}
 
 			// Execute each tool call.
 			var results []tools.ToolResult
@@ -376,17 +430,62 @@ func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, 
 				})
 			}
 
-			// Add tool results to history — one message per tool call with tool_call_id.
-			for _, r := range results {
-				content := r.Output
-				if r.Error != "" {
-					content = "Error: " + r.Error
+			// Add tool results to history — format depends on provider.
+			isGemini = strings.Contains(baseURL, "generativelanguage.googleapis.com") || strings.HasPrefix(model, "gemini")
+			isAnthropic = strings.Contains(baseURL, "anthropic.com") || strings.Contains(baseURL, "api.anthropic")
+
+			if isGemini {
+				// Gemini: functionResponse goes inside a "user" role message.
+				var parts []map[string]interface{}
+				for _, r := range results {
+					content := r.Output
+					if r.Error != "" {
+						content = "Error: " + r.Error
+					}
+					parts = append(parts, map[string]interface{}{
+						"functionResponse": map[string]interface{}{
+							"name": r.Name,
+							"response": map[string]interface{}{
+								"result": truncate(content, 10000),
+							},
+						},
+					})
 				}
 				messages = append(messages, map[string]interface{}{
-					"role":         "tool",
-					"tool_call_id": r.ToolCallID,
-					"content":      content,
+					"role":  "user",
+					"parts": parts,
 				})
+			} else if isAnthropic {
+				// Anthropic: tool results go in user messages with content blocks.
+				var contentBlocks []map[string]interface{}
+				for _, r := range results {
+					content := r.Output
+					if r.Error != "" {
+						content = "Error: " + r.Error
+					}
+					contentBlocks = append(contentBlocks, map[string]interface{}{
+						"type":         "tool_result",
+						"tool_use_id":  r.ToolCallID,
+						"content":      truncate(content, 10000),
+					})
+				}
+				messages = append(messages, map[string]interface{}{
+					"role":    "user",
+					"content": contentBlocks,
+				})
+			} else {
+				// OpenAI-compatible: one "tool" message per tool call.
+				for _, r := range results {
+					content := r.Output
+					if r.Error != "" {
+						content = "Error: " + r.Error
+					}
+					messages = append(messages, map[string]interface{}{
+						"role":         "tool",
+						"tool_call_id": r.ToolCallID,
+						"content":      truncate(content, 10000),
+					})
+				}
 			}
 
 			continue
@@ -672,7 +771,84 @@ func (h *Handler) sendError(requestID, msg string) {
 }
 
 func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, toolDefs []tools.ToolDefinition) (*apiResponse, error) {
-	// Wrap tools in OpenAI function format for NVIDIA/generic compatibility.
+	// Gemini uses a completely different API format — dispatch to specialized handler.
+	if strings.Contains(baseURL, "generativelanguage.googleapis.com") || (baseURL == "" && model != "" && strings.HasPrefix(model, "gemini")) {
+		return h.callGeminiAPI(apiKey, model, messages, temperature, maxTokens, toolDefs)
+	}
+
+	// Anthropic uses a different API format.
+	if strings.Contains(baseURL, "anthropic.com") || strings.Contains(baseURL, "api.anthropic") {
+		return h.callAnthropicAPI(baseURL, apiKey, model, messages, temperature, maxTokens, toolDefs)
+	}
+
+	// All others use OpenAI-compatible format (OpenAI, Groq, OpenRouter, NVIDIA, Ollama, xAI, Copilot).
+	return h.callOpenAICompatAPI(baseURL, apiKey, model, messages, temperature, maxTokens, toolDefs)
+}
+
+func dedupModels(models []string) []string {
+	seen := make(map[string]bool)
+	unique := make([]string, 0, len(models))
+	for _, m := range models {
+		if !seen[m] && m != "" {
+			seen[m] = true
+			unique = append(unique, m)
+		}
+	}
+	return unique
+}
+
+func resolveProviderBaseURL(provider string) string {
+	switch provider {
+	case "openai":
+		return "https://api.openai.com/v1"
+	case "anthropic":
+		return "https://api.anthropic.com"
+	case "groq":
+		return "https://api.groq.com/openai/v1"
+	case "nvidia":
+		return "https://integrate.api.nvidia.com/v1"
+	case "openrouter":
+		return "https://openrouter.ai/api/v1"
+	case "gemini":
+		return "" // Gemini uses a different API — handled separately
+	case "ollama":
+		return "http://localhost:11434/v1"
+	case "xai":
+		return "https://api.x.ai/v1"
+	case "copilot":
+		return "https://api.githubcopilot.com"
+	default:
+		return "https://api.openai.com/v1"
+	}
+}
+
+// resolveDefaultModel returns a sensible default model for each provider.
+func resolveDefaultModel(provider string) string {
+	switch provider {
+	case "nvidia":
+		return "nvidia/nemotron-3-ultra-550b-a55b"
+	case "groq":
+		return "llama-3.3-70b-versatile"
+	case "openrouter":
+		return "deepseek/deepseek-r1-0528:free"
+	case "gemini":
+		return "gemini-2.0-flash"
+	case "anthropic":
+		return "claude-3-5-haiku-20241022"
+	case "ollama":
+		return "llama3.1"
+	case "xai":
+		return "grok-3-mini-beta"
+	case "copilot":
+		return "gpt-4o"
+	default:
+		return "gpt-4o-mini"
+	}
+}
+
+// callOpenAICompatAPI handles providers that use the OpenAI chat/completions format:
+// OpenAI, Groq, OpenRouter, NVIDIA, Ollama, xAI, Copilot.
+func (h *Handler) callOpenAICompatAPI(baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, toolDefs []tools.ToolDefinition) (*apiResponse, error) {
 	wrappedTools := make([]map[string]interface{}, len(toolDefs))
 	for i, td := range toolDefs {
 		wrappedTools[i] = map[string]interface{}{
@@ -695,7 +871,7 @@ func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map
 	}
 
 	data, _ := json.Marshal(body)
-	log.Printf("[ai] API request body (first 500 chars): %s", truncate(string(data), 500))
+	log.Printf("[ai] OpenAI-compat request to %s model=%s", baseURL, model)
 
 	client := &http.Client{Timeout: 120 * time.Second}
 	req, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewReader(data))
@@ -704,6 +880,11 @@ func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	// OpenRouter requires HTTP-Referer header.
+	if strings.Contains(baseURL, "openrouter.ai") {
+		req.Header.Set("HTTP-Referer", "https://apkbuilder.app")
+		req.Header.Set("X-Title", "ApkBuilder AI")
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -724,49 +905,313 @@ func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map
 	return &fullResp, nil
 }
 
-func dedupModels(models []string) []string {
-	seen := make(map[string]bool)
-	unique := make([]string, 0, len(models))
-	for _, m := range models {
-		if !seen[m] && m != "" {
-			seen[m] = true
-			unique = append(unique, m)
+// callAnthropicAPI handles Anthropic's Messages API (different from OpenAI format).
+func (h *Handler) callAnthropicAPI(baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, toolDefs []tools.ToolDefinition) (*apiResponse, error) {
+	// Convert OpenAI-style messages to Anthropic format.
+	var systemMsg string
+	var anthropicMessages []map[string]interface{}
+
+	for _, m := range messages {
+		role := m["role"].(string)
+		content := m["content"].(string)
+		if role == "system" {
+			systemMsg = content
+			continue
+		}
+		// Anthropic only accepts "user" and "assistant" roles.
+		if role == "tool" {
+			// Convert tool results to user messages with tool_result content blocks.
+			toolCallID := m["tool_call_id"].(string)
+			anthropicMessages = append(anthropicMessages, map[string]interface{}{
+				"role": "user",
+				"content": []map[string]interface{}{
+					{
+						"type":      "tool_result",
+						"tool_use_id": toolCallID,
+						"content":   content,
+					},
+				},
+			})
+		} else {
+			anthropicMessages = append(anthropicMessages, map[string]interface{}{
+				"role":    role,
+				"content": content,
+			})
 		}
 	}
-	return unique
+
+	// Convert tool definitions to Anthropic format.
+	var anthropicTools []map[string]interface{}
+	for _, td := range toolDefs {
+		anthropicTools = append(anthropicTools, map[string]interface{}{
+			"name":        td.Name,
+			"description": td.Description,
+			"input_schema": td.Parameters,
+		})
+	}
+
+	body := map[string]interface{}{
+		"model":       model,
+		"max_tokens":  maxTokens,
+		"temperature": temperature,
+		"messages":    anthropicMessages,
+		"tools":       anthropicTools,
+	}
+	if systemMsg != "" {
+		body["system"] = systemMsg
+	}
+
+	data, _ := json.Marshal(body)
+	log.Printf("[ai] Anthropic request model=%s", model)
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	req, err := http.NewRequest("POST", baseURL+"/v1/messages", bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, truncate(string(respBody), 500))
+	}
+
+	// Parse Anthropic response and convert to our apiResponse format.
+	var anthropicResp struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text,omitempty"`
+			ID   string `json:"id,omitempty"`
+			Name string `json:"name,omitempty"`
+			Input json.RawMessage `json:"input,omitempty"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
+	}
+	if err := json.Unmarshal(respBody, &anthropicResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	// Build apiResponse from Anthropic content blocks.
+	resp2 := &apiResponse{}
+	choice := struct {
+		Message struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	}{}
+
+	for _, block := range anthropicResp.Content {
+		switch block.Type {
+		case "text":
+			choice.Message.Content += block.Text
+		case "tool_use":
+			choice.Message.ToolCalls = append(choice.Message.ToolCalls, struct {
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				} `json:"function"`
+			}{
+				ID:   block.ID,
+				Type: "function",
+			})
+			choice.Message.ToolCalls[len(choice.Message.ToolCalls)-1].Function.Name = block.Name
+			choice.Message.ToolCalls[len(choice.Message.ToolCalls)-1].Function.Arguments = block.Input
+		}
+	}
+	choice.FinishReason = anthropicResp.StopReason
+	resp2.Choices = []struct {
+		Message struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	}{choice}
+
+	return resp2, nil
 }
 
-func resolveProviderBaseURL(provider string) string {
-	switch provider {
-	case "openai":
-		return "https://api.openai.com/v1"
-	case "anthropic":
-		return "https://api.anthropic.com/v1"
-	case "groq":
-		return "https://api.groq.com/openai/v1"
-	case "nvidia":
-		return "https://integrate.api.nvidia.com/v1"
-	case "openrouter":
-		return "https://openrouter.ai/api/v1"
-	default:
-		return "https://api.openai.com/v1"
-	}
-}
+// callGeminiAPI handles Google Gemini's generateContent API.
+func (h *Handler) callGeminiAPI(apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, toolDefs []tools.ToolDefinition) (*apiResponse, error) {
+	// Build Gemini contents array.
+	var contents []map[string]interface{}
+	var systemInstruction map[string]interface{}
 
-// resolveDefaultModel returns a sensible default model for each provider.
-func resolveDefaultModel(provider string) string {
-	switch provider {
-	case "nvidia":
-		return "nvidia/nemotron-3-ultra-550b-a55b"
-	case "groq":
-		return "llama-3.1-8b-instant"
-	case "openrouter":
-		return "meta-llama/llama-3.1-8b-instruct:free"
-	case "anthropic":
-		return "claude-3-5-haiku-20241022"
-	default:
-		return "gpt-4o-mini"
+	for _, m := range messages {
+		role := m["role"].(string)
+		content := m["content"].(string)
+		if role == "system" {
+			systemInstruction = map[string]interface{}{
+				"parts": []map[string]interface{}{{"text": content}},
+			}
+			continue
+		}
+		// Gemini uses "user"/"model" instead of "user"/"assistant".
+		geminiRole := "user"
+		if role == "assistant" {
+			geminiRole = "model"
+		}
+		contents = append(contents, map[string]interface{}{
+			"role": geminiRole,
+			"parts": []map[string]interface{}{
+				{"text": content},
+			},
+		})
 	}
+
+	// Build Gemini tools.
+	var geminiTools []map[string]interface{}
+	var functionDecls []map[string]interface{}
+	for _, td := range toolDefs {
+		params, _ := json.Marshal(td.Parameters)
+		var paramSchema map[string]interface{}
+		json.Unmarshal(params, &paramSchema)
+
+		functionDecls = append(functionDecls, map[string]interface{}{
+			"name":        td.Name,
+			"description": td.Description,
+			"parameters":  paramSchema,
+		})
+	}
+	if len(functionDecls) > 0 {
+		geminiTools = append(geminiTools, map[string]interface{}{
+			"function_declarations": functionDecls,
+		})
+	}
+
+	body := map[string]interface{}{
+		"contents": contents,
+		"generationConfig": map[string]interface{}{
+			"temperature": temperature,
+			"maxOutputTokens": maxTokens,
+		},
+	}
+	if systemInstruction != nil {
+		body["systemInstruction"] = systemInstruction
+	}
+	if len(geminiTools) > 0 {
+		body["tools"] = geminiTools
+	}
+
+	data, _ := json.Marshal(body)
+	log.Printf("[ai] Gemini request model=%s", model)
+
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("Gemini API request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Gemini API returned %d: %s", resp.StatusCode, truncate(string(respBody), 500))
+	}
+
+	// Parse Gemini response.
+	var geminiResp struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text         string `json:"text"`
+					FunctionCall *struct {
+						Name string                 `json:"name"`
+						Args map[string]interface{} `json:"args"`
+					} `json:"functionCall"`
+				} `json:"parts"`
+				Role string `json:"role"`
+			} `json:"content"`
+			FinishReason string `json:"finishReason"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(respBody, &geminiResp); err != nil {
+		return nil, fmt.Errorf("failed to parse Gemini response: %v", err)
+	}
+
+	// Convert to apiResponse.
+	resp2 := &apiResponse{}
+	if len(geminiResp.Candidates) > 0 {
+		cand := geminiResp.Candidates[0]
+		choice := struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		}{}
+		choice.FinishReason = cand.FinishReason
+
+		for _, part := range cand.Content.Parts {
+			if part.Text != "" {
+				choice.Message.Content += part.Text
+			}
+			if part.FunctionCall != nil {
+				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+				tcID := fmt.Sprintf("call_%d", time.Now().UnixNano())
+				choice.Message.ToolCalls = append(choice.Message.ToolCalls, struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"function"`
+				}{
+					ID:   tcID,
+					Type: "function",
+				})
+				choice.Message.ToolCalls[len(choice.Message.ToolCalls)-1].Function.Name = part.FunctionCall.Name
+				choice.Message.ToolCalls[len(choice.Message.ToolCalls)-1].Function.Arguments = argsJSON
+			}
+		}
+		resp2.Choices = []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		}{choice}
+	}
+
+	return resp2, nil
 }
 
 func truncate(s string, n int) string {
