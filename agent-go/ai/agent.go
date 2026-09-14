@@ -664,7 +664,7 @@ func resolveProviderBaseURL(provider string) string {
 func resolveDefaultModel(provider string) string {
 	switch provider {
 	case "nvidia":
-		return "meta/llama-3.1-8b-instruct"
+		return "nvidia/llama-3.1-nemotron-70b-instruct"
 	case "groq":
 		return "llama-3.1-8b-instant"
 	case "openrouter":
