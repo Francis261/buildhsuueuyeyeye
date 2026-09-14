@@ -151,7 +151,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 		model = req.AgentConfig.CustomModel
 	}
 	if model == "" {
-		model = "gpt-4o-mini"
+		model = resolveDefaultModel(req.AgentConfig.Provider)
 	}
 
 	// Build system message with hardened sandbox instructions.
@@ -657,6 +657,22 @@ func resolveProviderBaseURL(provider string) string {
 		return "https://openrouter.ai/api/v1"
 	default:
 		return "https://api.openai.com/v1"
+	}
+}
+
+// resolveDefaultModel returns a sensible default model for each provider.
+func resolveDefaultModel(provider string) string {
+	switch provider {
+	case "nvidia":
+		return "meta/llama-3.1-8b-instruct"
+	case "groq":
+		return "llama-3.1-8b-instant"
+	case "openrouter":
+		return "meta-llama/llama-3.1-8b-instruct:free"
+	case "anthropic":
+		return "claude-3-5-haiku-20241022"
+	default:
+		return "gpt-4o-mini"
 	}
 }
 
