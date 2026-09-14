@@ -500,6 +500,7 @@ RULES:
 - After writing/editing, ALWAYS verify the result (read the file back, or run a test).
 - If a bash command fails, analyze the error and try a different approach.
 - For bash commands, the working directory is already set to the project root.
+- IMPORTANT: Make only ONE tool call per response. Do not try to call multiple tools at once.
 
 # Doing Tasks
 The user will primarily request you perform software engineering tasks. This includes solving bugs, adding new functionality, refactoring code, explaining code, and more. For these tasks the following steps are recommended:
