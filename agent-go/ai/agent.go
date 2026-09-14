@@ -216,6 +216,15 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, executor *tools.Executor, workDir string, originalFiles map[string]string, projectId, backendURL string) error {
 	toolDefs := tools.GetToolDefinitions()
 
+	// Loop detection: track recent tool call signatures.
+	type toolSig struct {
+		name string
+		args string
+	}
+	var recentCalls []toolSig
+	loopCount := 0
+	const maxRepeatedCalls = 3
+
 	for round := 0; round < maxToolRounds; round++ {
 		// Check if cancelled.
 		if ctx.Err() != nil {
@@ -244,6 +253,45 @@ func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, 
 
 		// Check for tool calls.
 		if len(msg.ToolCalls) > 0 {
+			// Detect loops: check if the same tool+args was called recently.
+			for _, tc := range msg.ToolCalls {
+				sig := toolSig{name: tc.Function.Name, args: string(tc.Function.Arguments)}
+				matched := 0
+				for _, prev := range recentCalls {
+					if prev.name == sig.name && prev.args == sig.args {
+						matched++
+					}
+				}
+				if matched >= maxRepeatedCalls-1 {
+					loopCount++
+				} else {
+					loopCount = 0
+				}
+				recentCalls = append(recentCalls, sig)
+				if len(recentCalls) > 10 {
+					recentCalls = recentCalls[len(recentCalls)-10:]
+				}
+			}
+
+			// If we've detected a loop, inject a warning and eventually force-stop.
+			if loopCount >= 3 {
+				h.a.Send(map[string]interface{}{
+					"type":      "ai_response",
+					"requestId": requestID,
+					"content":   "The model appears to be stuck in a loop. Stopping to avoid infinite recursion.",
+					"done":      true,
+				})
+				if len(originalFiles) > 0 && workDir != "." {
+					h.syncChangedFiles(requestID, workDir, originalFiles, projectId, backendURL)
+				}
+				return nil
+			}
+			if loopCount >= 1 {
+				messages = append(messages, map[string]interface{}{
+					"role":    "system",
+					"content": "STOP! You are repeating the same tool call. You must now provide your final answer as text without calling any more tools. Summarize what you found.",
+				})
+			}
 			// Convert API tool calls to our ToolCall type and build history-compatible tool_calls.
 			var toolCallsForHistory []map[string]interface{}
 			var toolCalls []tools.ToolCall
