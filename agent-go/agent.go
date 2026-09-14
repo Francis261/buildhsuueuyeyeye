@@ -186,6 +186,16 @@ func (a *Agent) readLoop() {
 			}
 			go a.ai.HandleAIRequest(req)
 
+		case "ai_cancel":
+			var cancelMsg struct {
+				Type      string `json:"type"`
+				RequestID string `json:"requestId"`
+			}
+			if err := json.Unmarshal(raw, &cancelMsg); err != nil {
+				continue
+			}
+			a.ai.CancelRequest(cancelMsg.RequestID)
+
 		case "artifact_ack":
 			var ack struct {
 				Type        string `json:"type"`
