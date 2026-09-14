@@ -194,13 +194,16 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 
 				result := executor.ExecuteToolCall(toolCall)
 
+				// Build a short summary for the client chat
+				summary := buildToolSummary(result, toolCall)
+
 				// Send tool result to client.
 				h.a.Send(map[string]interface{}{
 					"type":      "ai_tool_result",
 					"requestId": requestID,
 					"toolName":  result.Name,
 					"toolId":    result.ToolCallID,
-					"output":    result.Output,
+					"summary":   summary,
 					"error":     result.Error,
 				})
 
@@ -238,12 +241,13 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 						"toolId":    tc.ID,
 					})
 					result := executor.ExecuteToolCall(tc)
+					summary := buildToolSummary(result, tc)
 					h.a.Send(map[string]interface{}{
 						"type":      "ai_tool_result",
 						"requestId": requestID,
 						"toolName":  result.Name,
 						"toolId":    result.ToolCallID,
-						"output":    result.Output,
+						"summary":   summary,
 						"error":     result.Error,
 					})
 					toolResult := result.Output
@@ -285,6 +289,55 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 	}
 
 	return fmt.Errorf("exceeded maximum tool rounds (%d)", maxToolRounds)
+}
+
+// buildToolSummary creates a short human-readable summary of a tool call/result.
+func buildToolSummary(result tools.ToolResult, call tools.ToolCall) string {
+	var args map[string]interface{}
+	json.Unmarshal(call.Args, &args)
+
+	switch result.Name {
+	case "read":
+		fp := ""
+		if v, ok := args["filePath"].(string); ok { fp = v }
+		if result.Error != "" {
+			return fmt.Sprintf("Failed to read %s", fp)
+		}
+		return fmt.Sprintf("Read %s", fp)
+
+	case "write":
+		fp := ""
+		if v, ok := args["filePath"].(string); ok { fp = v }
+		if result.Error != "" {
+			return fmt.Sprintf("Failed to write %s", fp)
+		}
+		return fmt.Sprintf("Wrote %s", fp)
+
+	case "edit":
+		fp := ""
+		if v, ok := args["filePath"].(string); ok { fp = v }
+		if result.Error != "" {
+			return fmt.Sprintf("Failed to edit %s: %s", fp, result.Error)
+		}
+		return fmt.Sprintf("Edited %s", fp)
+
+	case "bash":
+		cmd := ""
+		if v, ok := args["command"].(string); ok { cmd = v }
+		if len(cmd) > 60 {
+			cmd = cmd[:57] + "..."
+		}
+		if result.Error != "" {
+			return fmt.Sprintf("Bash failed: %s", result.Error)
+		}
+		return fmt.Sprintf("Ran: %s", cmd)
+
+	default:
+		if result.Error != "" {
+			return fmt.Sprintf("%s error: %s", result.Name, result.Error)
+		}
+		return result.Name
+	}
 }
 
 // syncChangedFiles compares the current files with the original and sends changes back to the server.
