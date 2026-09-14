@@ -594,10 +594,23 @@ func (h *Handler) sendError(requestID, msg string) {
 }
 
 func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, toolDefs []tools.ToolDefinition) (*apiResponse, error) {
+	// Wrap tools in OpenAI function format for NVIDIA/generic compatibility.
+	wrappedTools := make([]map[string]interface{}, len(toolDefs))
+	for i, td := range toolDefs {
+		wrappedTools[i] = map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        td.Name,
+				"description": td.Description,
+				"parameters":  td.Parameters,
+			},
+		}
+	}
+
 	body := map[string]interface{}{
-		"model":      model,
-		"messages":   messages,
-		"tools":      toolDefs,
+		"model":       model,
+		"messages":    messages,
+		"tools":       wrappedTools,
 		"temperature": temperature,
 		"max_tokens":  maxTokens,
 	}
