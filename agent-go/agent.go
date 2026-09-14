@@ -88,10 +88,7 @@ func (a *Agent) connect() error {
 		return err
 	}
 
-	header := make(map[string][]string)
-	header["Origin"] = []string{a.cfg.BackendURL}
-	header["User-Agent"] = []string{"apkbuilder-agent/1.0"}
-	c, resp, err := websocket.DefaultDialer.Dial(u.String(), header)
+	c, resp, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		if resp != nil {
 			return fmt.Errorf("bad handshake (HTTP %d): %w", resp.StatusCode, err)

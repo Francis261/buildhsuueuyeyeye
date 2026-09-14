@@ -27,17 +27,25 @@ func NewHandler(a core.AgentInterface) *Handler {
 }
 
 func (h *Handler) HandleAIRequest(req core.AIRequest) {
-	log.Printf("[ai] Request: requestId=%s model=%s provider=%s fileCount=%d", req.RequestID, req.Model, req.AgentConfig.Provider, len(req.Files))
+	log.Printf("[ai] Request: requestId=%s model=%s provider=%s projectId=%s", req.RequestID, req.Model, req.AgentConfig.Provider, req.ProjectID)
 
 	if req.AgentConfig == nil || req.AgentConfig.APIKey == "" {
 		h.sendError(req.RequestID, "AI is not configured. No API key provided.")
 		return
 	}
 
-	// Extract project files to a temp directory if provided.
+	// Get project files — either from ProjectID (HTTP fetch) or inline Files.
 	var workDir string
 	var originalFiles map[string]string
-	if len(req.Files) > 0 {
+
+	if req.ProjectID != "" && req.BackendURL != "" {
+		// Fetch project from server via HTTP
+		fetchedFiles, err := h.fetchProject(req.BackendURL, req.ProjectID)
+		if err != nil {
+			h.sendError(req.RequestID, fmt.Sprintf("Failed to fetch project: %v", err))
+			return
+		}
+		originalFiles = fetchedFiles
 		tmpDir, err := os.MkdirTemp("", "ai-project-*")
 		if err != nil {
 			h.sendError(req.RequestID, fmt.Sprintf("Failed to create temp directory: %v", err))
@@ -45,21 +53,29 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 		}
 		defer os.RemoveAll(tmpDir)
 		workDir = tmpDir
-
-		// Extract files
+		for relPath, content := range originalFiles {
+			fullPath := filepath.Join(tmpDir, relPath)
+			dir := filepath.Dir(fullPath)
+			os.MkdirAll(dir, 0755)
+			os.WriteFile(fullPath, []byte(content), 0644)
+		}
+		log.Printf("[ai] Fetched %d files from server for project %s", len(originalFiles), req.ProjectID)
+	} else if len(req.Files) > 0 {
+		// Legacy: extract inline files
+		tmpDir, err := os.MkdirTemp("", "ai-project-*")
+		if err != nil {
+			h.sendError(req.RequestID, fmt.Sprintf("Failed to create temp directory: %v", err))
+			return
+		}
+		defer os.RemoveAll(tmpDir)
+		workDir = tmpDir
 		originalFiles = make(map[string]string)
 		for relPath, content := range req.Files {
 			originalFiles[relPath] = content
 			fullPath := filepath.Join(tmpDir, relPath)
 			dir := filepath.Dir(fullPath)
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				log.Printf("[ai] Failed to create directory %s: %v", dir, err)
-				continue
-			}
-			if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
-				log.Printf("[ai] Failed to write file %s: %v", relPath, err)
-				continue
-			}
+			os.MkdirAll(dir, 0755)
+			os.WriteFile(fullPath, []byte(content), 0644)
 		}
 		log.Printf("[ai] Extracted %d files to %s", len(req.Files), tmpDir)
 	} else {
@@ -134,7 +150,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 
 	var lastError string
 	for _, tryModel := range modelsToTry {
-		err := h.runWithTools(req.RequestID, baseURL, req.AgentConfig.APIKey, tryModel, messages, temperature, maxTokens, executor, workDir, originalFiles)
+		err := h.runWithTools(req.RequestID, baseURL, req.AgentConfig.APIKey, tryModel, messages, temperature, maxTokens, executor, workDir, originalFiles, req.ProjectID, req.BackendURL)
 		if err != nil {
 			lastError = fmt.Sprintf("Model %s error: %v", tryModel, err)
 			log.Printf("[ai] %s", lastError)
@@ -147,7 +163,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 }
 
 // runWithTools executes the AI loop with tool support.
-func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, executor *tools.Executor, workDir string, originalFiles map[string]string) error {
+func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, messages []map[string]interface{}, temperature float64, maxTokens int, executor *tools.Executor, workDir string, originalFiles map[string]string, projectId, backendURL string) error {
 	toolDefs := tools.GetToolDefinitions()
 
 	for round := 0; round < maxToolRounds; round++ {
@@ -267,7 +283,7 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 		// No tool calls — this is the final text response.
 		// Before sending the response, sync any changed files back to the server.
 		if len(originalFiles) > 0 && workDir != "." {
-			h.syncChangedFiles(requestID, workDir, originalFiles)
+			h.syncChangedFiles(requestID, workDir, originalFiles, projectId, backendURL)
 		}
 
 		if msg.Content != "" {
@@ -341,7 +357,7 @@ func buildToolSummary(result tools.ToolResult, call tools.ToolCall) string {
 }
 
 // syncChangedFiles compares the current files with the original and sends changes back to the server.
-func (h *Handler) syncChangedFiles(requestID, workDir string, originalFiles map[string]string) {
+func (h *Handler) syncChangedFiles(requestID, workDir string, originalFiles map[string]string, projectId, backendURL string) {
 	changedFiles := make(map[string]string)
 
 	// Directories to exclude from sync
@@ -419,11 +435,24 @@ func (h *Handler) syncChangedFiles(requestID, workDir string, originalFiles map[
 
 	if len(changedFiles) > 0 {
 		log.Printf("[ai] Syncing %d changed files back to server", len(changedFiles))
-		h.a.Send(map[string]interface{}{
-			"type":      "source_sync",
-			"requestId": requestID,
-			"files":     changedFiles,
-		})
+
+		// Use HTTP sync if projectId is available, otherwise fall back to WebSocket
+		if projectId != "" && backendURL != "" {
+			if err := h.uploadChanges(backendURL, projectId, requestID, changedFiles); err != nil {
+				log.Printf("[ai] HTTP sync failed: %v, falling back to WebSocket", err)
+				h.a.Send(map[string]interface{}{
+					"type":      "source_sync",
+					"requestId": requestID,
+					"files":     changedFiles,
+				})
+			}
+		} else {
+			h.a.Send(map[string]interface{}{
+				"type":      "source_sync",
+				"requestId": requestID,
+				"files":     changedFiles,
+			})
+		}
 	}
 }
 
@@ -554,4 +583,53 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// fetchProject downloads project files from the server via HTTP.
+func (h *Handler) fetchProject(backendURL, projectId string) (map[string]string, error) {
+	url := strings.TrimRight(backendURL, "/") + "/api/ai/project/" + projectId
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Files map[string]string `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode failed: %v", err)
+	}
+	return result.Files, nil
+}
+
+// uploadChanges sends changed files back to the server via HTTP.
+func (h *Handler) uploadChanges(backendURL, projectId, requestId string, changes map[string]string) error {
+	url := strings.TrimRight(backendURL, "/") + "/api/ai/sync-changes/" + projectId
+
+	body := map[string]interface{}{
+		"changes":   changes,
+		"requestId": requestId,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(url, "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		return fmt.Errorf("HTTP POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
