@@ -187,6 +187,12 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 
 	// Try models in order.
 	modelsToTry := dedupModels(append([]string{model}, req.AgentConfig.Models...))
+	// Add provider-specific fallbacks if only one model specified.
+	if len(modelsToTry) == 1 {
+		if req.AgentConfig.Provider == "nvidia" {
+			modelsToTry = append(modelsToTry, "meta/llama-3.1-8b-instruct")
+		}
+	}
 
 	temperature := req.AgentConfig.Temperature
 	if temperature == 0 {
@@ -751,7 +757,7 @@ func resolveProviderBaseURL(provider string) string {
 func resolveDefaultModel(provider string) string {
 	switch provider {
 	case "nvidia":
-		return "nvidia/llama-3.3-70b-instruct"
+		return "nvidia/nemotron-3-ultra-550b-a55b"
 	case "groq":
 		return "llama-3.1-8b-instant"
 	case "openrouter":
