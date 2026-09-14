@@ -310,7 +310,7 @@ func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, 
 				})
 				toolCallsForHistory = append(toolCallsForHistory, map[string]interface{}{
 					"id":   tc.ID,
-					"type": tc.Type,
+					"type": "function",
 					"function": map[string]interface{}{
 						"name":      tc.Function.Name,
 						"arguments": string(tc.Function.Arguments),
