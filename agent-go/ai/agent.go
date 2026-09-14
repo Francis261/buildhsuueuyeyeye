@@ -189,8 +189,15 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 	modelsToTry := dedupModels(append([]string{model}, req.AgentConfig.Models...))
 	// Add provider-specific fallbacks if only one model specified.
 	if len(modelsToTry) == 1 {
-		if req.AgentConfig.Provider == "nvidia" {
-			modelsToTry = append(modelsToTry, "meta/llama-3.1-8b-instruct")
+		switch req.AgentConfig.Provider {
+		case "nvidia":
+			modelsToTry = append(modelsToTry, "nvidia/llama-3.1-8b-instruct", "meta/llama-3.3-70b-instruct-v1")
+		case "groq":
+			modelsToTry = append(modelsToTry, "llama-3.1-8b-instant", "gemma2-9b-it")
+		case "openrouter":
+			modelsToTry = append(modelsToTry, "meta-llama/llama-3.1-8b-instruct:free", "qwen/qwen-2.5-72b-instruct:free")
+		case "gemini":
+			modelsToTry = append(modelsToTry, "gemini-2.0-flash-lite", "gemini-1.5-flash")
 		}
 	}
 
