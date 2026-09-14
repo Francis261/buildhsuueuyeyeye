@@ -676,6 +676,7 @@ func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map
 		"model":       model,
 		"messages":    messages,
 		"tools":       wrappedTools,
+		"tool_choice": "auto",
 		"temperature": temperature,
 		"max_tokens":  maxTokens,
 	}
