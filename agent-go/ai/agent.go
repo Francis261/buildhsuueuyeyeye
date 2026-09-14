@@ -90,7 +90,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 	if systemPrompt == "" {
 		systemPrompt = "You are an expert mobile app code assistant. You have access to tools to read, write, edit files and run bash commands. Use tools to help the user with their coding tasks."
 	}
-	systemPrompt += "\n\nYou have access to the following tools:\n- read: Read a file or directory\n- write: Write content to a file\n- edit: Search and replace in a file\n- bash: Execute a bash command\n\nWhen you need to use a tool, respond with tool calls in the format specified by the API. After receiving tool results, continue helping the user."
+	systemPrompt += "\n\nYou have access to the following tools:\n- read: Read a file or directory\n- write: Write content to a file\n- edit: Search and replace in a file\n- bash: Execute a bash command\n\nIMPORTANT RULES:\n- Use the EXACT file paths as they appear in the project (e.g. src/screens/HomeScreen.tsx). Do NOT use placeholder paths like /path/to/project/root.\n- For bash commands, do NOT specify a workdir unless needed. The working directory is already set to the project root.\n- When reading files, use the exact relative path from the project root.\n- When editing files, provide enough context to make the oldString unique."
 
 	// Build file context.
 	fileContext := ""
@@ -221,6 +221,46 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 		}
 
 		// No tool calls — this is the final text response.
+		// But some models (like llama) return tool calls as JSON in the text content.
+		// Try to detect and parse that.
+		if msg.Content != "" && len(msg.ToolCalls) == 0 {
+			if extracted := tools.ParseToolCalls(msg.Content); len(extracted) > 0 {
+				// Model returned tool calls as text — execute them.
+				messages = append(messages, map[string]interface{}{
+					"role":    "assistant",
+					"content": msg.Content,
+				})
+				for _, tc := range extracted {
+					h.a.Send(map[string]interface{}{
+						"type":      "ai_tool_call",
+						"requestId": requestID,
+						"toolName":  tc.Name,
+						"toolId":    tc.ID,
+					})
+					result := executor.ExecuteToolCall(tc)
+					h.a.Send(map[string]interface{}{
+						"type":      "ai_tool_result",
+						"requestId": requestID,
+						"toolName":  result.Name,
+						"toolId":    result.ToolCallID,
+						"output":    result.Output,
+						"error":     result.Error,
+					})
+					toolResult := result.Output
+					if result.Error != "" {
+						toolResult = "Error: " + result.Error
+					}
+					messages = append(messages, map[string]interface{}{
+						"role":         "tool",
+						"tool_call_id": tc.ID,
+						"content":      toolResult,
+					})
+				}
+				continue
+			}
+		}
+
+		// No tool calls — this is the final text response.
 		// Before sending the response, sync any changed files back to the server.
 		if len(originalFiles) > 0 && workDir != "." {
 			h.syncChangedFiles(requestID, workDir, originalFiles)
@@ -251,12 +291,32 @@ func (h *Handler) runWithTools(requestID, baseURL, apiKey, model string, message
 func (h *Handler) syncChangedFiles(requestID, workDir string, originalFiles map[string]string) {
 	changedFiles := make(map[string]string)
 
+	// Directories to exclude from sync
+	excludeDirs := map[string]bool{
+		"node_modules": true,
+		".git":         true,
+		".expo":        true,
+		"build":        true,
+		".gradle":      true,
+		"android":      true,
+		"ios":          true,
+		".next":        true,
+		"dist":         true,
+		".cache":       true,
+		"__pycache__":  true,
+		".idea":        true,
+		".vscode":      true,
+	}
+
 	// Walk the work directory and compare with original files
 	err := filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 		if info.IsDir() {
+			if excludeDirs[info.Name()] && path != workDir {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -267,6 +327,11 @@ func (h *Handler) syncChangedFiles(requestID, workDir string, originalFiles map[
 		}
 		// Normalize path separators
 		relPath = filepath.ToSlash(relPath)
+
+		// Skip binary and large files
+		if info.Size() > 100*1024 {
+			return nil
+		}
 
 		// Read current content
 		content, err := os.ReadFile(path)

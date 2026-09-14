@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 )
 
@@ -15,6 +16,16 @@ type Executor struct {
 // NewExecutor creates a new tool executor.
 func NewExecutor(workDir string) *Executor {
 	return &Executor{WorkDir: workDir}
+}
+
+// resolvePath resolves a file path relative to the work directory.
+// If the path is already absolute, it's returned as-is.
+// If the path starts with "./" or doesn't start with "/", it's resolved relative to WorkDir.
+func (e *Executor) resolvePath(filePath string) string {
+	if filepath.IsAbs(filePath) {
+		return filePath
+	}
+	return filepath.Join(e.WorkDir, filePath)
 }
 
 // ExecuteToolCall runs a single tool call and returns the result.
@@ -41,7 +52,7 @@ func (e *Executor) ExecuteToolCall(call ToolCall) ToolResult {
 		if filePath == "" {
 			output, err = "", fmt.Errorf("filePath is required")
 		} else {
-			output, err = ReadFile(filePath, offset, limit)
+			output, err = ReadFile(e.resolvePath(filePath), offset, limit)
 		}
 
 	case "write":
@@ -50,7 +61,7 @@ func (e *Executor) ExecuteToolCall(call ToolCall) ToolResult {
 		if filePath == "" || content == "" {
 			output, err = "", fmt.Errorf("filePath and content are required")
 		} else {
-			output, err = WriteFile(filePath, content)
+			output, err = WriteFile(e.resolvePath(filePath), content)
 		}
 
 	case "edit":
@@ -61,7 +72,7 @@ func (e *Executor) ExecuteToolCall(call ToolCall) ToolResult {
 		if filePath == "" || oldString == "" {
 			output, err = "", fmt.Errorf("filePath and oldString are required")
 		} else {
-			output, err = EditFile(filePath, oldString, newString, replaceAll)
+			output, err = EditFile(e.resolvePath(filePath), oldString, newString, replaceAll)
 		}
 
 	case "bash":
@@ -71,8 +82,10 @@ func (e *Executor) ExecuteToolCall(call ToolCall) ToolResult {
 		if command == "" {
 			output, err = "", fmt.Errorf("command is required")
 		} else {
-			if workdir == "" {
+			if workdir == "" || workdir == "/path/to/project/root" || workdir == "." {
 				workdir = e.WorkDir
+			} else if !filepath.IsAbs(workdir) {
+				workdir = filepath.Join(e.WorkDir, workdir)
 			}
 			output, err = BashExec(command, workdir, timeout)
 		}
@@ -142,6 +155,20 @@ func ParseToolCalls(content string) []ToolCall {
 			}
 			return toolCalls
 		}
+	}
+
+	// Try to parse as a single tool call JSON object: {"name": "write", "content": "...", ...}
+	var singleTool struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(content), &singleTool); err == nil && singleTool.Name != "" {
+		// Re-marshal the whole object as the arguments
+		toolCalls = append(toolCalls, ToolCall{
+			ID:   fmt.Sprintf("tool-%d", len(toolCalls)+1),
+			Name: singleTool.Name,
+			Args: json.RawMessage(content),
+		})
+		return toolCalls
 	}
 
 	return toolCalls
