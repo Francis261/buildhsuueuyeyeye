@@ -308,12 +308,13 @@ func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, 
 					Name: tc.Function.Name,
 					Args: tc.Function.Arguments,
 				})
+				argsStr := string(tc.Function.Arguments)
 				toolCallsForHistory = append(toolCallsForHistory, map[string]interface{}{
 					"id":   tc.ID,
 					"type": "function",
 					"function": map[string]interface{}{
 						"name":      tc.Function.Name,
-						"arguments": string(tc.Function.Arguments),
+						"arguments": argsStr,
 					},
 				})
 			}
@@ -689,6 +690,7 @@ func (h *Handler) callAPIWithTools(baseURL, apiKey, model string, messages []map
 	}
 
 	data, _ := json.Marshal(body)
+	log.Printf("[ai] API request body (first 500 chars): %s", truncate(string(data), 500))
 
 	client := &http.Client{Timeout: 120 * time.Second}
 	req, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewReader(data))
