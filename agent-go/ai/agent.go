@@ -370,11 +370,18 @@ func (h *Handler) runWithTools(ctx context.Context, requestID, baseURL, apiKey, 
 				})
 			}
 
-			// Add tool results to history.
-			messages = append(messages, map[string]interface{}{
-				"role":    "tool",
-				"content": tools.FormatToolResults(results),
-			})
+			// Add tool results to history — one message per tool call with tool_call_id.
+			for _, r := range results {
+				content := r.Output
+				if r.Error != "" {
+					content = "Error: " + r.Error
+				}
+				messages = append(messages, map[string]interface{}{
+					"role":         "tool",
+					"tool_call_id": r.ToolCallID,
+					"content":      content,
+				})
+			}
 
 			continue
 		}
