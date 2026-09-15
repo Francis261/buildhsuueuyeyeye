@@ -193,7 +193,7 @@ func (h *Handler) HandleAIRequest(req core.AIRequest) {
 		case "nvidia":
 			modelsToTry = append(modelsToTry, "nvidia/llama-3.1-8b-instruct", "meta/llama-3.3-70b-instruct-v1")
 		case "groq":
-			modelsToTry = append(modelsToTry, "llama-3.1-8b-instant", "gemma2-9b-it")
+			modelsToTry = append(modelsToTry, "qwen/qwen3.8-27b", "openai/gpt-oss-20b")
 		case "openrouter":
 			modelsToTry = append(modelsToTry, "nvidia/nemotron-3.5-lightning:free", "cohere/north-mini-code:free")
 		case "gemini":
@@ -835,7 +835,7 @@ func resolveDefaultModel(provider string) string {
 	case "nvidia":
 		return "nvidia/nemotron-3-ultra-550b-a55b"
 	case "groq":
-		return "llama-3.3-70b-versatile"
+		return "openai/gpt-oss-120b"
 	case "openrouter":
 		return "nvidia/nemotron-3-ultra-550b-a55b:free"
 	case "gemini":
